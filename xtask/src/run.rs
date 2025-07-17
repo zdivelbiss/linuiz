@@ -1,10 +1,5 @@
+use anyhow::Result;
 use std::path::Path;
-
-#[derive(Debug, ValueEnum, Clone, Copy, PartialEq, Eq)]
-pub enum Accelerator {
-    Kvm,
-    None,
-}
 
 #[derive(Debug, ValueEnum, Clone, Copy, PartialEq, Eq)]
 pub enum Cpu {
@@ -29,8 +24,8 @@ pub struct Options {
     cpu: Cpu,
 
     /// Emulation accelerator to use.
-    #[arg(long, default_value = "none")]
-    accel: Accelerator,
+    #[arg(long, default_value = "false")]
+    disable_kvm: bool,
 
     /// Number of CPUs to emulate.
     #[arg(long, default_value = "4")]
@@ -68,11 +63,7 @@ pub struct Options {
     gdb: bool,
 }
 
-pub fn run<P: AsRef<Path>>(
-    sh: &xshell::Shell,
-    temp_dir: P,
-    options: Options,
-) -> anyhow::Result<()> {
+pub fn run(sh: &xshell::Shell, temp_dir: impl AsRef<Path>, options: Options) -> Result<()> {
     if !options.nobuild {
         crate::build::build(sh, temp_dir.as_ref(), options.build_options)?;
     }
@@ -115,20 +106,11 @@ pub fn run<P: AsRef<Path>>(
     }
     .arg("-no-shutdown")
     .arg("-no-reboot")
-    .args(["-serial", "mon:stdio"])
+    .args(["-debugcon", "file:.debug/debug.log"])
+    .args(["-serial", "stdio"])
     .args(["-drive", "format=raw,file=run/disk0.img,id=disk1,if=none"])
     .args(["-net", "none"])
     .args(["-M", "smm=off"])
-    .args([
-        "-machine",
-        match (options.cpu, options.accel) {
-            (Cpu::Rv64, Accelerator::None) => "virt",
-            (Cpu::Rv64, accel) => panic!("invalid accelerator for RISC-V: {accel:?}"),
-
-            (_, Accelerator::Kvm) => "q35,accel=kvm",
-            (_, Accelerator::None) => "q35",
-        },
-    ])
     .args([
         "-cpu",
         match options.cpu {
@@ -149,6 +131,10 @@ pub fn run<P: AsRef<Path>>(
         },
     ]);
 
+    if !options.disable_kvm {
+        run_cmd = run_cmd.arg("-enable-kvm");
+    }
+
     if options.log {
         run_cmd = run_cmd
             .args(["-d", "int,guest_errors"])
@@ -156,7 +142,7 @@ pub fn run<P: AsRef<Path>>(
     }
 
     if options.nographic {
-        run_cmd = run_cmd.arg("-nographic");
+        run_cmd = run_cmd.args(["-display", "none"]);
     }
 
     if options.gdb {

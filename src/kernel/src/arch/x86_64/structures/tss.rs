@@ -1,48 +1,90 @@
 #![allow(clippy::module_name_repetitions)]
 
-use super::gdt;
+use crate::{
+    arch::x86_64::structures::gdt::{GlobalDescriptorTable, SystemSegmentDescriptor},
+    mem::alloc::KERNEL_ALLOCATOR,
+};
+use core::ptr::NonNull;
 
+type StackTableStack = crate::mem::stack::Stack<0x16000>;
 
-pub fn ptr_as_descriptor(tss_ptr: core::ptr::NonNull<TaskStateSegment>) -> gdt::Descriptor {
-    use bit_field::BitField;
-
-    let tss_ptr_u64 = tss_ptr.addr().get() as u64;
-
-    let mut low = gdt::DescriptorFlags::PRESENT.bits();
-    // base
-    low.set_bits(16..40, tss_ptr_u64.get_bits(0..24));
-    low.set_bits(56..64, tss_ptr_u64.get_bits(24..32));
-    // limit (the `-1` is needed since the bound is inclusive, not exclusive)
-    low.set_bits(0..16, (core::mem::size_of::<TaskStateSegment>() - 1) as u64);
-    // type (0b1001 = available 64-bit tss)
-    low.set_bits(40..44, 0b1001);
-
-    // high 32 bits of base
-    let mut high = 0;
-    high.set_bits(0..32, tss_ptr_u64.get_bits(32..64));
-
-    gdt::Descriptor::SystemSegment(low, high)
+// Pre-defined indexes into the interrupt stack table (IST).
+#[repr(u16)]
+#[derive(Debug, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptStackTableIndex {
+    Debug = 0,
+    NonMaskableInterrupt = 1,
+    DoubleFault = 2,
+    MachineCheck = 3,
 }
 
-/// ## Safety
-///
-/// * Descriptor must be valid as the core's task state segment.
-/// * Caller must ensure loading a new TSS will not result in undefined behaviour.
-pub unsafe fn load(descriptor: gdt::Descriptor) {
-    crate::interrupts::without(|| {
-        // Store current GDT pointer to restore later.
-        let cur_gdt = gdt::sgdt();
-        // Create temporary kernel GDT to avoid a GPF on switching to it.
-        let mut temp_gdt = gdt::GlobalDescriptorTable::new();
-        temp_gdt.add_entry(gdt::Descriptor::kernel_code_segment());
-        temp_gdt.add_entry(gdt::Descriptor::kernel_data_segment());
-        let tss_selector = temp_gdt.add_entry(descriptor);
+#[repr(C, packed(4))]
+#[derive(FromZeros)]
+pub struct TaskStateSegment {
+    _1: [u8; 4],
 
-        // Load temp GDT ...
-        temp_gdt.load_unsafe();
-        // ... load TSS from temporary GDT ...
-        load_tss(tss_selector);
-        // ... and restore cached GDT.
-        super::gdt::lgdt(&cur_gdt);
-    });
+    /// The stack pointers used when a privilege level change occurs from a lower privilege level
+    /// to a higher one (e.g. ring 3 to ring 0).
+    privilege_stack_table: [Option<NonNull<StackTableStack>>; 3],
+
+    _2: [u8; 8],
+
+    /// The stack pointers used when an entry in the Interrupt Descriptor Table has an IST value
+    /// other than 0.
+    interrupt_stack_table: [Option<NonNull<StackTableStack>>; 7],
+
+    _3: [u8; 10],
+
+    /// The 16-bit offset to the I/O permission bit map from the 64-bit TSS base.
+    iomap_base: u16,
+}
+
+impl TaskStateSegment {
+    /// Loads this [`TaskStateSegment`] into the task state segment register.
+    ///
+    /// # Remarks
+    ///
+    /// Only one [`TaskStateSegment`] should be loaded on each hardware thread. It's likely a
+    /// runtime error if more than one are loaded per hardware threads.
+    pub fn load_local() {
+        fn allocate_stack_table_stack() -> NonNull<StackTableStack> {
+            KERNEL_ALLOCATOR
+                .allocate_t::<StackTableStack>()
+                .expect("failed to allocate a new stack for task state segment")
+        }
+
+        let tss = crate::mem::alloc::KERNEL_ALLOCATOR
+            .allocate_t_static::<Self>()
+            .expect("failed to allocate task state segment");
+
+        // Set the stack for transitions to ring 0.
+        tss.privilege_stack_table[0] = Some(allocate_stack_table_stack());
+
+        // Set the stacks for faults that cannot be disabled or are caused by runtime errors.
+        tss.interrupt_stack_table[usize::from(u16::from(InterruptStackTableIndex::Debug))] =
+            Some(allocate_stack_table_stack());
+        tss.interrupt_stack_table
+            [usize::from(u16::from(InterruptStackTableIndex::NonMaskableInterrupt))] =
+            Some(allocate_stack_table_stack());
+        tss.interrupt_stack_table[usize::from(u16::from(InterruptStackTableIndex::DoubleFault))] =
+            Some(allocate_stack_table_stack());
+        tss.interrupt_stack_table[usize::from(u16::from(InterruptStackTableIndex::MachineCheck))] =
+            Some(allocate_stack_table_stack());
+
+        GlobalDescriptorTable::with_temporary(|temp_gdt| {
+            let tss_segment_descriptor = SystemSegmentDescriptor::from_tss(tss);
+            let tss_segment_selector = temp_gdt.append_segment(tss_segment_descriptor);
+
+            trace!("Loading: {:#X?}", core::ptr::from_ref(tss));
+
+            // Safety: No memory safety concerns.
+            unsafe {
+                core::arch::asm!(
+                    "ltr {:x}",
+                    in(reg) tss_segment_selector.as_u16(),
+                    options(nostack, nomem, preserves_flags)
+                );
+            }
+        });
+    }
 }

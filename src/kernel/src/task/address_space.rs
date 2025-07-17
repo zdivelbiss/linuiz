@@ -6,40 +6,27 @@ use crate::mem::{
 use core::{num::NonZeroUsize, ptr::NonNull};
 use libsys::{Address, Page, Virtual, page_size};
 
-crate::error_impl! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[allow(clippy::enum_variant_names)]
-    pub enum Error {
-        /// Indicates an allocation error occured in the backing allocator.
-        AllocError => None,
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub enum Error {
+    #[error("address space has run out of memory")]
+    OutOfMemory,
 
-        /// Indicates a malformed raw address was provided to an `Address` constructor.
-        MalformedAddress => None,
+    #[error("a malformed address address was provided")]
+    MalformedAddress,
 
-        /// Indicates a provided address was not usable by the function.
-        InvalidAddress => None,
+    #[error("a provided address was not usable by the function")]
+    InvalidAddress,
 
-        OverlappingAddress => None,
+    #[error("provided address range overruns valid virtual addresses")]
+    AddressRangeOverrun,
 
-        AddressOverrun { value: usize } => None,
+    #[error("address is not mapped: {0:X?}")]
+    NotMapped(Address<Virtual>),
 
-        AddressIndexOverrun { index: usize } => None,
-
-        NotMapped { addr: Address<Virtual> } => None,
-
-        /// Provides the error that occured within the internal `Mapper`.
-        Paging { err: paging::Error } => Some(err)
-    }
-}
-
-impl From<paging::Error> for Error {
-    fn from(value: paging::Error) -> Self {
-        match value {
-            paging::Error::AllocError => Self::AllocError,
-            paging::Error::NotMapped { addr } => Self::NotMapped { addr },
-            err => Self::Paging { err },
-        }
-    }
+    /// Provides the error that occured within the internal `Mapper`.
+    #[error(transparent)]
+    Mapper(#[from] paging::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,11 +58,14 @@ impl AddressSpace {
     }
 
     pub fn new_userspace() -> Self {
-        Self::new(unsafe {
-            Mapper::new_unsafe(
-                TableDepth::max(),
-                crate::mem::copy_kernel_page_table().unwrap(),
-            )
+        Self::new({
+            // Safety: Kernel mapper is valid and has only one copy.
+            unsafe {
+                Mapper::new_unsafe(
+                    TableDepth::max(),
+                    crate::mem::copy_kernel_page_table().unwrap(),
+                )
+            }
         })
     }
 
@@ -86,6 +76,7 @@ impl AddressSpace {
         root_frame == cr3_frame
     }
 
+    // TODO maybe should return `Result<NonNull<[MaybeUninit<u8>]>>`?
     pub fn mmap(
         &mut self,
         address: Option<Address<Page>>,
@@ -93,7 +84,7 @@ impl AddressSpace {
         // TODO support lazy mapping
         // lazy: bool,
         permissions: MmapPermissions,
-    ) -> Result<NonNull<[u8]>> {
+    ) -> Result<NonNull<[u8]>, Error> {
         if let Some(address) = address {
             self.map_exact(address, page_count, permissions)
         } else {
@@ -104,59 +95,61 @@ impl AddressSpace {
     #[cfg_attr(debug_assertions, inline(never))]
     fn map_any(
         &mut self,
-        page_count: NonZeroUsize,
-        permissions: MmapPermissions,
-    ) -> Result<NonNull<[u8]>> {
-        let walker = unsafe {
-            paging::walker::Walker::new(
-                self.0.view_page_table(),
-                TableDepth::max(),
-                TableDepth::min(),
-            )
-            .unwrap()
-        };
+        _page_count: NonZeroUsize,
+        _permissions: MmapPermissions,
+    ) -> Result<NonNull<[u8]>, Error> {
+        // let walker = unsafe {
+        //     paging::walker::Walker::new(
+        //         self.0.view_page_table(),
+        //         TableDepth::max(),
+        //         TableDepth::min(),
+        //     )
+        //     .unwrap()
+        // };
 
-        let mut index = 0;
-        let mut run = 0;
-        walker.walk(|entry| {
-            use core::ops::ControlFlow;
+        // let mut index = 0;
+        // let mut run = 0;
+        // walker.walk(|entry| {
+        //     use core::ops::ControlFlow;
 
-            if entry.is_none() {
-                run += 1;
+        //     if entry.is_none() {
+        //         run += 1;
 
-                if run == page_count.get() {
-                    return ControlFlow::Break(());
-                }
-            } else {
-                run = 0;
-            }
+        //         if run == page_count.get() {
+        //             return ControlFlow::Break(());
+        //         }
+        //     } else {
+        //         run = 0;
+        //     }
 
-            index += 1;
+        //     index += 1;
 
-            ControlFlow::Continue(())
-        });
+        //     ControlFlow::Continue(())
+        // });
 
-        match run.cmp(&page_count.get()) {
-            core::cmp::Ordering::Equal => {
-                let address = Address::<Page>::new(index << libsys::page_shift().get()).unwrap();
-                let flags = TableEntryFlags::PRESENT
-                    | TableEntryFlags::USER
-                    | TableEntryFlags::from(permissions);
+        // match run.cmp(&page_count.get()) {
+        //     core::cmp::Ordering::Equal => {
+        //         let address = Address::<Page>::new(index << libsys::page_shift().get()).unwrap();
+        //         let flags = TableEntryFlags::PRESENT
+        //             | TableEntryFlags::USER
+        //             | TableEntryFlags::from(permissions);
 
-                unsafe { self.invoke_mapper(address, page_count, flags) }
-            }
-            core::cmp::Ordering::Less => Err(Error::AllocError),
-            core::cmp::Ordering::Greater => unreachable!(),
-        }
+        //         unsafe { self.invoke_mapper(address, page_count, flags) }
+        //     }
+        //     core::cmp::Ordering::Less => Err(Error::OutOfMemory),
+        //     core::cmp::Ordering::Greater => unreachable!(),
+        // }
+
+        todo!()
     }
 
-    #[cfg_attr(debug_assertions, inline(never))]
     fn map_exact(
         &mut self,
         address: Address<Page>,
         page_count: NonZeroUsize,
         permissions: MmapPermissions,
-    ) -> Result<NonNull<[u8]>> {
+    ) -> Result<NonNull<[u8]>, Error> {
+        // Safety: Caller is required to maintain invariants.
         unsafe {
             self.invoke_mapper(
                 address,
@@ -176,13 +169,12 @@ impl AddressSpace {
         address: Address<Page>,
         page_count: NonZeroUsize,
         flags: TableEntryFlags,
-    ) -> Result<NonNull<[u8]>> {
+    ) -> Result<NonNull<[u8]>, Error> {
         let mapping_size = page_count.get() * page_size();
         (0..mapping_size)
             .step_by(page_size())
             .map(|offset| Address::new_truncate(address.get().get() + offset))
-            .try_for_each(|offset_page| self.0.auto_map(offset_page, flags))
-            .map_err(Error::from)?;
+            .try_for_each(|offset_page| self.0.auto_map(offset_page, flags))?;
 
         Ok(NonNull::slice_from_raw_parts(
             NonNull::new(address.as_ptr()).unwrap(),
@@ -190,42 +182,52 @@ impl AddressSpace {
         ))
     }
 
+    /// # Safety
+    ///
+    /// TODO
     pub unsafe fn set_flags(
         &mut self,
         address: Address<Page>,
         page_count: NonZeroUsize,
         flags: TableEntryFlags,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         for index_offset in 0..page_count.get() {
             let offset_index = address.index() + index_offset;
             let offset_address =
-                Address::from_index(offset_index).ok_or(Error::AddressIndexOverrun {
-                    index: offset_index,
-                })?;
+                Address::from_index(offset_index).ok_or(Error::AddressRangeOverrun)?;
 
-            self.0
-                .set_page_attributes(offset_address, None, flags, paging::FlagsModify::Set)
-                .map_err(|err| Error::Paging { err })?;
+            // Safety: Caller is required to maintain safety invariants.
+            unsafe {
+                self.0.set_page_attributes(
+                    offset_address,
+                    None,
+                    flags,
+                    paging::FlagsModify::Set,
+                )?;
+            }
         }
 
         Ok(())
     }
 
-    pub fn get_flags(&self, address: Address<Page>) -> Result<TableEntryFlags> {
-        self.0.get_page_attributes(address).ok_or(Error::NotMapped {
-            addr: address.get(),
-        })
+    pub fn get_flags(&self, address: Address<Page>) -> Result<TableEntryFlags, Error> {
+        self.0
+            .get_page_attributes(address)
+            .ok_or(Error::NotMapped(address.get()))
     }
 
     pub fn is_mmapped(&self, address: Address<Page>) -> bool {
         self.0.is_mapped(address, None)
     }
 
-    /// ## Safety
+    /// # Safety
     ///
     /// Caller must ensure that switching the currently active address space will not cause undefined behaviour.
     pub unsafe fn swap_into(&self) {
-        self.0.swap_into();
+        // Safety: Caller is required to maintain safety invariants.
+        unsafe {
+            self.0.swap_into();
+        }
     }
 }
 

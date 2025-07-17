@@ -1,7 +1,11 @@
-use std::{fs::File, io::Error, path::Path};
+use anyhow::Result;
+use std::{env::set_var, fs::File, path::Path};
+use xshell::Shell;
 
-#[derive(Debug, ValueEnum, Clone, Copy, PartialEq, Eq)]
+/// Possible target platforms to compile for.
 #[allow(non_camel_case_types)]
+#[derive(Debug, ValueEnum, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
 pub enum Target {
     x86_64,
     riscv64gc,
@@ -20,10 +24,6 @@ impl Target {
 
 #[derive(Parser)]
 pub struct Options {
-    /// Whether to build in release mode (with all optimizations).
-    #[arg(long)]
-    release: bool,
-
     /// Verbose build output. Equivalent to `cargo build -vv`.
     #[arg(short, long)]
     verbose: bool,
@@ -37,33 +37,39 @@ pub struct Options {
     #[arg(short, long)]
     target: Target,
 
+    /// Whether to build in release mode (with all optimizations).
+    #[arg(long)]
+    release: bool,
+
     #[arg(long)]
     drivers: Vec<String>,
 }
 
-pub fn build<P: AsRef<Path>>(
-    sh: &xshell::Shell,
-    temp_dir: P,
-    options: Options,
-) -> anyhow::Result<()> {
-    let _cargo_log = {
-        let mut cargo_log = Vec::new();
+pub fn build(sh: &Shell, temp_dir: impl AsRef<Path>, options: Options) -> Result<()> {
+    cmd!(sh, "cargo fmt --check").run()?;
+    cmd!(sh, "cargo sort --workspace --grouped --check").run()?;
 
-        if options.fingerprint {
-            cargo_log.push("cargo::core::compiler::fingerprint=info");
+    // Safety: Single-threaded.
+    unsafe {
+        set_var("LINUIZ_OUT_DIR", temp_dir.as_ref().as_os_str());
+    }
+
+    if options.fingerprint {
+        // Safety: Single-threaded.
+        unsafe {
+            set_var("CARGO_LOG", "cargo::core::compiler::fingerprint=info");
         }
-
-        sh.push_env("CARGO_LOG", cargo_log.join(" "))
-    };
+    }
 
     let root_dir = sh.current_dir();
 
-    cmd!(sh, "cargo fmt --check").run()?;
-
     let mut build_cmd = cmd!(sh, "cargo build")
-        .args(["--target", options.target.as_triple()])
-        .args(["--artifact-dir", temp_dir.as_ref().to_str().unwrap()])
-        .args(["-Z", "unstable-options"]);
+        .arg("--target")
+        .arg(options.target.as_triple())
+        .arg("--artifact-dir")
+        .arg(temp_dir.as_ref().as_os_str())
+        .arg("-Z")
+        .arg("unstable-options");
 
     if options.release {
         build_cmd = build_cmd.arg("--release");
@@ -88,43 +94,28 @@ pub fn build<P: AsRef<Path>>(
         root_dir.join("run/system/linuiz/kernel"),
     )?;
 
-    build_drivers_archive(
-        temp_dir.as_ref(),
-        root_dir.join("run/system/linuiz/drivers"),
-        sh.read_dir(temp_dir.as_ref())?.into_iter(),
-        &options.drivers,
-    )
-    .expect("error attempting to package drivers");
-
-    Ok(())
-}
-
-fn build_drivers_archive<P1: AsRef<Path>, P2: AsRef<Path>>(
-    drivers_path: P1,
-    archive_path: P2,
-    files: impl Iterator<Item = std::path::PathBuf>,
-    include_drivers: &[String],
-) -> Result<(), Error> {
-    let drivers_path = drivers_path.as_ref();
-
     // compress userspace drivers and write to archive file
     let mut archive_builder = tar::Builder::new(
-        File::create(archive_path).expect("failed to create or open the driver package file"),
+        File::create(root_dir.join("run/system/linuiz/drivers"))
+            .expect("failed to create or open the driver package file"),
     );
 
-    files
+    sh.read_dir(temp_dir.as_ref())?
+        .into_iter()
         .filter(|p| {
             p.file_name()
                 .map(std::ffi::OsStr::to_string_lossy)
-                .filter(|driver_name| include_drivers.iter().any(|s| s.eq(driver_name)))
+                .filter(|driver_name| options.drivers.iter().any(|s| s.eq(driver_name)))
                 .is_some()
         })
         .try_for_each(|path| {
             println!("Packaging driver: {:?}", path.file_name().unwrap());
 
-            let rel_path = path.strip_prefix(drivers_path).unwrap();
+            let rel_path = path.strip_prefix(temp_dir.as_ref()).unwrap();
             archive_builder.append_file(rel_path, &mut File::open(&path)?)
         })?;
 
-    archive_builder.finish()
+    archive_builder.finish()?;
+
+    Ok(())
 }
